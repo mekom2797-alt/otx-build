@@ -21,7 +21,15 @@ jobs:
           git clone --depth 1 --branch "${{ inputs.branch }}" https://github.com/mattyx14/otxserver.git otx
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      - name: Cache Boost
+        id: boostcache
+        uses: actions/cache@v4
+        with:
+          path: C:\local\boost_1_84_0
+          key: boost-1.84-msvc14.3
+
       - name: Install Boost 1.84
+        if: steps.boostcache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           curl.exe -L -o boost.exe "https://sourceforge.net/projects/boost/files/boost-binaries/1.84.0/boost_1_84_0-msvc-14.3-64.exe/download"
@@ -40,12 +48,24 @@ jobs:
           if (-not $root) { Write-Host "registerenv.bat not found"; Get-ChildItem C:\sdk | Select-Object Name; exit 1 }
           Add-Content $env:GITHUB_ENV "SDK-NOBOOST=$root"
 
+      - name: Cache vcpkg libs
+        id: vcpkgcache
+        uses: actions/cache@v4
+        with:
+          path: C:\vcpkg\installed
+          key: vcpkg-otx-luajit-libxml2-mariadb-openssl-zlib-mpir-sqlite3-v1
+
       - name: Install vcpkg libs
+        if: steps.vcpkgcache.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           $vc = $env:VCPKG_INSTALLATION_ROOT
           & "$vc\vcpkg.exe" install luajit:x64-windows libxml2:x64-windows libmariadb:x64-windows openssl:x64-windows zlib:x64-windows mpir:x64-windows sqlite3:x64-windows --disable-metrics
-          $inst = "$vc\installed\x64-windows"
+
+      - name: List vcpkg libs
+        shell: pwsh
+        run: |
+          $inst = "$env:VCPKG_INSTALLATION_ROOT\installed\x64-windows"
           Write-Host "=== lua headers ==="
           Get-ChildItem "$inst\include" -Recurse -Include luajit.h,lua.h,luaconf.h | Select-Object -ExpandProperty FullName
           Write-Host "=== all libs ==="
@@ -89,7 +109,7 @@ jobs:
           $extraLib.Add($shim); $extraLib.Add("$inst\lib")
           if (Test-Path $boostLib) { $extraLib.Add($boostLib) }
 
-          # Pre-create lua lib aliases
+          # Lua lib aliases
           $lj = Get-ChildItem "$inst\lib" -Filter lua51.lib -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $lj) { $lj = Get-ChildItem "$inst\lib" -Filter *luajit*.lib -ErrorAction SilentlyContinue | Select-Object -First 1 }
           if ($lj) {
@@ -97,24 +117,24 @@ jobs:
             Write-Host "Lua lib aliases created from $($lj.Name)"
           }
 
-          # Pre-create OpenSSL 1.0 name aliases -> OpenSSL 3 libs
+          # OpenSSL 1.0 names -> OpenSSL 3 libs
           $crypto = Join-Path "$inst\lib" 'libcrypto.lib'
           $ssl    = Join-Path "$inst\lib" 'libssl.lib'
           if (Test-Path $crypto) { foreach ($n in 'libeay32.lib','libeay.lib','eay32.lib') { Copy-Item $crypto (Join-Path $shim $n) -Force }; Write-Host "OpenSSL crypto aliases created" }
           if (Test-Path $ssl)    { foreach ($n in 'ssleay32.lib','ssleay.lib','ssl32.lib')  { Copy-Item $ssl    (Join-Path $shim $n) -Force }; Write-Host "OpenSSL ssl aliases created" }
 
-          # Pre-create other common aliases
+          # Other common aliases
           $map = @{
-            'sqlite.lib'   = 'sqlite3.lib'
-            'libmysql.lib' = 'libmariadb.lib'
+            'sqlite.lib'      = 'sqlite3.lib'
+            'libmysql.lib'    = 'libmariadb.lib'
             'mysqlclient.lib' = 'libmariadb.lib'
-            'libxml2_a.lib' = 'libxml2.lib'
-            'libxml.lib'   = 'libxml2.lib'
-            'zlib1.lib'    = 'zlib.lib'
-            'zdll.lib'     = 'zlib.lib'
-            'libgmp.lib'   = 'mpir.lib'
-            'gmp.lib'      = 'mpir.lib'
-            'libgmpxx.lib' = 'mpir.lib'
+            'libxml2_a.lib'   = 'libxml2.lib'
+            'libxml.lib'      = 'libxml2.lib'
+            'zlib1.lib'       = 'zlib.lib'
+            'zdll.lib'        = 'zlib.lib'
+            'libgmp.lib'      = 'mpir.lib'
+            'gmp.lib'         = 'mpir.lib'
+            'libgmpxx.lib'    = 'mpir.lib'
           }
           foreach ($k in $map.Keys) {
             $src = Join-Path "$inst\lib" $map[$k]
@@ -207,13 +227,39 @@ jobs:
             return $null
           }
 
+          # MySQL: libmariadb 3.4+ forces TLS; XAMPP MySQL has no SSL -> disable enforcement before every connect
+          $helperLines = @(
+            '/*OTX_NOSSL*/',
+            '#ifndef OTX_NOSSL_HELPER',
+            '#define OTX_NOSSL_HELPER',
+            'static inline MYSQL* otx_real_connect(MYSQL* m, const char* h, const char* u, const char* p, const char* d, unsigned int port, const char* s, unsigned long f) {',
+            '  char o = 0;',
+            '  mysql_options(m, MYSQL_OPT_SSL_ENFORCE, &o);',
+            '  mysql_options(m, MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &o);',
+            '  return (mysql_real_connect)(m, h, u, p, d, port, s, f);',
+            '}',
+            '#endif'
+          )
+          $helper = "`n" + ($helperLines -join "`n") + "`n"
+          $incPattern = '(?m)^[ \t]*#[ \t]*include[ \t]*[<"][^>"]*mysql\.h[>"][^\r\n]*'
+
           function Apply-Patches {
             $files = Get-ChildItem otx -Recurse -Include *.cpp,*.h,*.hpp -File -ErrorAction SilentlyContinue
             foreach ($f in $files) {
               $txt = [IO.File]::ReadAllText($f.FullName, $latin1)
               $new = $txt
+
+              # libxml2 >= 2.12
               $new = $new -replace '\bxmlErrorPtr\b', 'const xmlError*'
               $new = $new -replace 'const\s+const\s+xmlError\*', 'const xmlError*'
+
+              # MySQL no-TLS patch
+              $new = [regex]::Replace($new, '\bmysql_real_connect\s*\(', 'otx_real_connect(')
+              if ($new -notmatch 'OTX_NOSSL') {
+                $m = [regex]::Match($new, $incPattern)
+                if ($m.Success) { $new = $new.Insert($m.Index + $m.Length, $helper) }
+              }
+
               if ($new -ne $txt) {
                 [IO.File]::WriteAllText($f.FullName, $new, $latin1)
                 Write-Host "PATCHED: $($f.FullName)"
