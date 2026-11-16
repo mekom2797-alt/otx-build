@@ -40,18 +40,16 @@ jobs:
           if (-not $root) { Write-Host "registerenv.bat not found"; Get-ChildItem C:\sdk | Select-Object Name; exit 1 }
           Add-Content $env:GITHUB_ENV "SDK-NOBOOST=$root"
 
-      - name: Install vcpkg libs (LuaJIT, libxml2, mariadb, ...)
+      - name: Install vcpkg libs
         shell: pwsh
         run: |
           $vc = $env:VCPKG_INSTALLATION_ROOT
-          & "$vc\vcpkg.exe" install luajit:x64-windows libxml2:x64-windows libmariadb:x64-windows openssl:x64-windows zlib:x64-windows mpir:x64-windows --disable-metrics
+          & "$vc\vcpkg.exe" install luajit:x64-windows libxml2:x64-windows libmariadb:x64-windows openssl:x64-windows zlib:x64-windows mpir:x64-windows sqlite3:x64-windows --disable-metrics
           $inst = "$vc\installed\x64-windows"
-          Write-Host "=== luajit.h / lua.h / luaconf.h locations ==="
+          Write-Host "=== lua headers ==="
           Get-ChildItem "$inst\include" -Recurse -Include luajit.h,lua.h,luaconf.h | Select-Object -ExpandProperty FullName
-          Write-Host "=== lua libs ==="
-          Get-ChildItem "$inst\lib" -Filter *lua*.lib | Select-Object -ExpandProperty Name
-          Write-Host "=== Lua headers inside the OTX repo (if any) ==="
-          Get-ChildItem otx -Recurse -Include lua.h,luaconf.h -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+          Write-Host "=== all libs ==="
+          Get-ChildItem "$inst\lib" -Filter *.lib | Select-Object -ExpandProperty Name
 
       - name: Inspect project dependencies
         shell: pwsh
@@ -63,8 +61,6 @@ jobs:
             Write-Host "=== $tag ==="
             [regex]::Matches($t, "<$tag>(.*?)</$tag>") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
           }
-          Write-Host "=== platforms in sln ==="
-          Select-String -Path (Get-ChildItem otx -Recurse -Filter TheOTXServer.sln | Select-Object -First 1).FullName -Pattern 'Release\|' | Select-Object -First 10 | ForEach-Object { $_.Line.Trim() }
 
       - name: Build with auto-fix
         id: build
@@ -85,7 +81,7 @@ jobs:
           $defines  = New-Object System.Collections.Generic.List[string]
           foreach ($d in '_HAS_AUTO_PTR_ETC=1','_CRT_SECURE_NO_WARNINGS','_WINSOCK_DEPRECATED_NO_WARNINGS','_SILENCE_ALL_CXX17_DEPRECATION_WARNINGS','_SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING','BOOST_BIND_GLOBAL_PLACEHOLDERS','BOOST_ASIO_ENABLE_OLD_SERVICES') { $defines.Add($d) }
 
-          # LuaJIT headers FIRST (Lua 5.1 API: LUA_GLOBALSINDEX, luaL_register, ...)
+          # LuaJIT headers FIRST
           $luajitH = Get-ChildItem "$inst\include" -Recurse -Filter luajit.h -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($luajitH) { $extraInc.Add($luajitH.DirectoryName); Write-Host "LuaJIT include: $($luajitH.DirectoryName)" }
           else { Write-Host "WARNING: luajit.h not found" }
@@ -100,6 +96,31 @@ jobs:
             foreach ($n in 'lua51.lib','lua5.1.lib','lua.lib','luajit.lib','lua5.1-static.lib') { Copy-Item $lj.FullName (Join-Path $shim $n) -Force }
             Write-Host "Lua lib aliases created from $($lj.Name)"
           }
+
+          # Pre-create OpenSSL 1.0 name aliases -> OpenSSL 3 libs
+          $crypto = Join-Path "$inst\lib" 'libcrypto.lib'
+          $ssl    = Join-Path "$inst\lib" 'libssl.lib'
+          if (Test-Path $crypto) { foreach ($n in 'libeay32.lib','libeay.lib','eay32.lib') { Copy-Item $crypto (Join-Path $shim $n) -Force }; Write-Host "OpenSSL crypto aliases created" }
+          if (Test-Path $ssl)    { foreach ($n in 'ssleay32.lib','ssleay.lib','ssl32.lib')  { Copy-Item $ssl    (Join-Path $shim $n) -Force }; Write-Host "OpenSSL ssl aliases created" }
+
+          # Pre-create other common aliases
+          $map = @{
+            'sqlite.lib'   = 'sqlite3.lib'
+            'libmysql.lib' = 'libmariadb.lib'
+            'mysqlclient.lib' = 'libmariadb.lib'
+            'libxml2_a.lib' = 'libxml2.lib'
+            'libxml.lib'   = 'libxml2.lib'
+            'zlib1.lib'    = 'zlib.lib'
+            'zdll.lib'     = 'zlib.lib'
+            'libgmp.lib'   = 'mpir.lib'
+            'gmp.lib'      = 'mpir.lib'
+            'libgmpxx.lib' = 'mpir.lib'
+          }
+          foreach ($k in $map.Keys) {
+            $src = Join-Path "$inst\lib" $map[$k]
+            if (Test-Path $src) { Copy-Item $src (Join-Path $shim $k) -Force }
+          }
+
           $tried = @{}
 
           function Install-Port([string]$port) {
@@ -154,13 +175,21 @@ jobs:
             return $null
           }
 
-          $alias = @{ 'mysql'=@('mariadb','mysql'); 'gmp'=@('mpir','gmp'); 'ssleay'=@('libssl','ssl'); 'libeay'=@('libcrypto','crypto'); 'ssl'=@('libssl'); 'crypto'=@('libcrypto'); 'lua'=@('lua51','luajit') }
+          $alias = @{
+            'mysql'=@('mariadb','mysql'); 'gmp'=@('mpir','gmp')
+            'eay32'=@('libcrypto','crypto'); 'libeay32'=@('libcrypto','crypto'); 'libeay'=@('libcrypto','crypto')
+            'ssleay32'=@('libssl','ssl'); 'ssleay'=@('libssl','ssl')
+            'ssl'=@('libssl'); 'crypto'=@('libcrypto')
+            'lua'=@('lua51','luajit')
+          }
           function Norm([string]$n) { return (($n.ToLower() -replace '\.lib$','' -replace '^lib','') -replace '[^a-z0-9]','') }
 
           function Find-LibMatch([string]$wanted) {
             $w = Norm $wanted
             $names = @($w); if ($alias.ContainsKey($w)) { $names += $alias[$w] }
             if ($w -match '^lua') { $names += 'lua51' }
+            if ($w -match 'eay') { $names += 'libcrypto' }
+            if ($w -match 'ssleay|^ssl') { $names += 'libssl' }
             $pool = @()
             $pool += Get-ChildItem "$inst\lib" -Filter *.lib -File -ErrorAction SilentlyContinue
             if (Test-Path $boostLib) { $pool += Get-ChildItem $boostLib -Filter *.lib -File -ErrorAction SilentlyContinue }
@@ -178,13 +207,11 @@ jobs:
             return $null
           }
 
-          # Source patches for modern libraries (idempotent)
           function Apply-Patches {
             $files = Get-ChildItem otx -Recurse -Include *.cpp,*.h,*.hpp -File -ErrorAction SilentlyContinue
             foreach ($f in $files) {
               $txt = [IO.File]::ReadAllText($f.FullName, $latin1)
               $new = $txt
-              # libxml2 >= 2.12: xmlGetLastError returns const xmlError*
               $new = $new -replace '\bxmlErrorPtr\b', 'const xmlError*'
               $new = $new -replace 'const\s+const\s+xmlError\*', 'const xmlError*'
               if ($new -ne $txt) {
@@ -225,7 +252,7 @@ jobs:
 
           $seen = @{}
           $ok = $false
-          foreach ($i in 1..15) {
+          foreach ($i in 1..20) {
             Apply-Patches
             Write-Targets
             Write-Host "=============== build attempt $i ==============="
@@ -252,6 +279,7 @@ jobs:
             foreach ($m in [regex]::Matches($log, "cannot open (?:input )?file '([^']+)'")) {
               $f = Split-Path $m.Groups[1].Value -Leaf
               if ($seen["L:$f"] -or $f -notmatch '\.lib$') { continue }; $seen["L:$f"] = $true
+              if (Test-Path (Join-Path $shim $f)) { $changed = $true; Write-Host "Shim already exists for $f, retrying"; continue }
               $hit = Find-LibMatch $f
               if (-not $hit) {
                 foreach ($p in (Ports-ForLib $f)) {
@@ -267,9 +295,6 @@ jobs:
             }
             if (($log -match 'C2371|C2011|winsock') -and -not $defines.Contains('WIN32_LEAN_AND_MEAN')) {
               $defines.Add('WIN32_LEAN_AND_MEAN'); $changed = $true; Write-Host "FIX: WIN32_LEAN_AND_MEAN"
-            }
-            if (($log -match "'xmlErrorPtr'|const xmlError") -and -not $seen['XML']) {
-              $seen['XML'] = $true; $changed = $true; Write-Host "FIX: libxml2 patch re-applied"
             }
             if ($log -match 'MSB4126|MSB4057[^\r\n]*x64') { Write-Host "Project has no x64 configuration"; break }
             if (-not $changed) { Write-Host "No known fix matched, stopping."; break }
